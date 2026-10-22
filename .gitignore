@@ -1,0 +1,8 @@
+.vendor/
+.serena/
+# skills copied by rune from catalog/packs.json "sources" (see lib/catalog.py sync)
+/plugins/*/upstream/*
+!/plugins/*/upstream/.gitkeep
+# private grimorio clones and the Claude marketplace generated from them (see lib/catalog.py)
+/grimorios/
+/.claude-plugin/marketplace.json

@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# End-to-end simulation of "public core + private grimorio" with local bare repos (file://), a fake gh and
+# throwaway signing keys: updates that only take owner-signed commits, the migration of an install of the old
+# single private repo (rune update and bootstrap), a teammate, a new teammate with a pending invitation, an
+# outsider, a revoked teammate and offline safety. Needs git >= 2.34 and ssh-keygen; Claude and OpenCode
+# checks run only when those CLIs are installed (RUNE_TEST_CLIS=0 skips them). KEEP=1 keeps the sandbox.
+set -euo pipefail
+
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# under $HOME: OpenCode does not look for project skills under /tmp
+BASE="$(mktemp -d "${RUNE_TEST_BASE:-$HOME}/.rune-split.XXXXXX")"
+cleanup() { if [ "${KEEP:-0}" = 1 ]; then echo "sandbox kept: $BASE"; else rm -rf "$BASE"; fi; }
+trap cleanup EXIT
+fails=0
+ok() { printf 'ok    %s\n' "$*"; }
+bad() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+check() { local msg="$1"; shift; if "$@"; then ok "$msg"; else bad "$msg"; fi; }
+has() { command -v "$1" >/dev/null 2>&1; }
+CLIS="${RUNE_TEST_CLIS:-1}"
+
+REMOTE="$BASE/remote/MarlyAcosta"
+OLD_URL="file://$REMOTE/runemind.git"
+GRIM_URL="file://$REMOTE/runemind-grimorios.git"
+export RUNEMIND_CORE_URL="$OLD_URL" RUNEMIND_LEGACY_GRIMORIO_URL="$GRIM_URL"
+export GIT_CONFIG_GLOBAL="$BASE/gitconfig" GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+mkdir -p "$REMOTE" "$BASE/src" "$BASE/work" "$BASE/homes" "$BASE/fakebin" "$BASE/keys"
+git config --global init.defaultBranch main
+git config --global advice.detachedHead false
+
+# ---------- signing keys ----------
+KEYS="$BASE/keys"
+ssh-keygen -q -t ed25519 -N '' -C owner -f "$KEYS/owner"
+ssh-keygen -q -t ed25519 -N '' -C evil -f "$KEYS/evil"
+printf 'owner@example.com namespaces="git" %s\n' "$(cut -d' ' -f1,2 "$KEYS/owner.pub")" > "$KEYS/allowed_signers"
+
+# commit_as owner|evil|none dir message
+commit_as() {
+  git -C "$2" add -A
+  if [ "$1" = none ]; then git -C "$2" -c commit.gpgsign=false commit -q --allow-empty -m "$3"
+  else git -C "$2" -c gpg.format=ssh -c user.signingkey="$KEYS/$1.pub" commit -q -S --allow-empty -m "$3"; fi
+}
+
+# ---------- fake gh: accounts per $HOME, one shared "GitHub" in $FAKE_GH_STATE ----------
+export FAKE_GH_STATE="$BASE/github.json"
+cat > "$BASE/fake_gh.py" <<'PY'
+import json, os, re, sys
+state = os.environ["FAKE_GH_STATE"]
+args = sys.argv[1:]
+def accounts():
+    p = os.path.join(os.environ["HOME"], ".fake-gh-accounts")
+    return [l.strip() for l in open(p) if l.strip()] if os.path.exists(p) else []
+if args[:2] == ["auth", "status"]:
+    if not accounts():
+        sys.stderr.write("You are not logged into any GitHub hosts.\n"); sys.exit(1)
+    for a in accounts():
+        print("  ✓ Logged in to github.com account %s (keyring)" % a)
+    sys.exit(0)
+if args[:2] == ["auth", "token"]:
+    u = args[args.index("-u") + 1] if "-u" in args else ""
+    if u in accounts():
+        print("tok-" + u); sys.exit(0)
+    sys.exit(1)
+if not args or args[0] != "api" or os.environ.get("FAKE_GH_OFFLINE"):
+    sys.stderr.write("error connecting to api.github.com\n"); sys.exit(1)
+tok = os.environ.get("GH_TOKEN", "")
+me = tok[4:] if tok.startswith("tok-") else None
+if not me:
+    sys.stderr.write("gh: not authenticated\n"); sys.exit(4)
+method, path, i = "GET", None, 1
+while i < len(args):
+    if args[i] == "-X": method = args[i + 1]; i += 2
+    elif args[i] in ("-f", "-F"): i += 2
+    elif args[i].startswith("-"): i += 1
+    else: path = args[i]; i += 1
+path = path.split("?")[0]
+silent = "--silent" in args
+d = json.load(open(state)); repos = d["repos"]
+def readable(full): r = repos.get(full); return r and (not r["private"] or me == r["owner"] or me in r["collaborators"])
+def obj(full):
+    r = repos[full]
+    return {"full_name": full, "clone_url": r["clone_url"], "private": r["private"], "owner": {"login": r["owner"]}, "topics": r["topics"]}
+def out(v):
+    if not silent: print(json.dumps(v))
+def save(): json.dump(d, open(state, "w"), indent=1)
+def missing(): print('{"message": "Not Found"}'); sys.stderr.write("gh: Not Found (HTTP 404)\n"); sys.exit(1)
+with open(state + ".log", "a") as log: log.write("%s %s %s\n" % (me, method, path))
+m = re.fullmatch(r"repos/([^/]+/[^/]+)(?:/(collaborators|invitations)(?:/([^/]+))?)?", path)
+inv = re.fullmatch(r"user/repository_invitations/(\d+)", path)
+if path == "user": out({"login": me})
+elif path == "user/repos": out([obj(f) for f, r in repos.items() if me == r["owner"] or me in r["collaborators"]])
+elif path == "user/repository_invitations":
+    out([{"id": x["id"], "repository": obj(f)} for f, r in repos.items() for x in r["invitations"] if x["invitee"] == me])
+elif inv and method == "PATCH":
+    for f, r in repos.items():
+        for x in list(r["invitations"]):
+            if x["id"] == int(inv.group(1)) and x["invitee"] == me:
+                r["invitations"].remove(x); r["collaborators"].append(me); save(); sys.exit(0)
+    missing()
+elif m:
+    full, sub, arg = m.groups()
+    if not readable(full): missing()
+    r = repos[full]
+    if sub is None: out(obj(full))
+    elif me != r["owner"]: sys.stderr.write("gh: Forbidden (HTTP 403)\n"); sys.exit(1)
+    elif sub == "collaborators" and arg and method == "PUT":
+        if arg not in r["collaborators"] and not any(x["invitee"] == arg for x in r["invitations"]):
+            d["next"] = d.get("next", 100) + 1
+            r["invitations"].append({"id": d["next"], "invitee": arg})
+        save()
+    elif sub == "collaborators" and arg and method == "DELETE":
+        if arg in r["collaborators"]: r["collaborators"].remove(arg)
+        save()
+    elif sub == "collaborators": out([{"login": c} for c in r["collaborators"]])
+    elif sub == "invitations" and arg and method == "DELETE":
+        r["invitations"] = [x for x in r["invitations"] if str(x["id"]) != arg]; save()
+    elif sub == "invitations": out([{"id": x["id"], "invitee": {"login": x["invitee"]}} for x in r["invitations"]])
+    else: missing()
+else: missing()
+PY
+printf '#!/usr/bin/env bash\nexec python3 "%s" "$@"\n' "$BASE/fake_gh.py" > "$BASE/fakebin/gh"
+chmod +x "$BASE/fakebin/gh"
+echo '{"repos": {}}' > "$FAKE_GH_STATE"
+
+# ---------- trees: public core, old single repo (core + fixture grimorio), grimorio-only ----------
+# in the private repo the admin script builds the core; in the public core the core is this checkout
+if [ -x "$LIB/scripts/admin/build-public-core" ]; then
+  "$LIB/scripts/admin/build-public-core" "$BASE/src/core" >/dev/null
+else
+  mkdir -p "$BASE/src/core"
+  (cd "$LIB" && git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' f; do
+    [ -f "$f" ] && cp --parents "$f" "$BASE/src/core/"; done)
+fi
+cp "$KEYS/allowed_signers" "$BASE/src/core/security/allowed_signers"
+cp -a "$BASE/src/core/." "$BASE/src/legacy/"
+L="$BASE/src/legacy"
+cat > "$L/grimorio.json" <<'EOF'
+{"schema": 1, "packs": [
+  {"id": "vtex", "claude_name": "vtex", "dir": "plugins/vtex", "skills": ["fx-storefront"], "mode": "auto",
+   "label": "VTEX IO", "description": "fixture", "marketplace": {"description": "fixture storefront"},
+   "detect": {"manifest_keys": ["vendor", "builders"]}},
+  {"id": "gestion", "claude_name": "gestion", "dir": "plugins/gestion", "skills": ["fx-pm"], "mode": "global",
+   "label": "gestión", "description": "fixture", "marketplace": {"description": "fixture pm"}}
+]}
+EOF
+for p in vtex:fx-storefront gestion:fx-pm; do
+  pack="${p%%:*}"; skill="${p#*:}"
+  mkdir -p "$L/plugins/$pack/.claude-plugin" "$L/plugins/$pack/skills/$skill"
+  printf '{"name": "%s", "version": "0.1.0", "description": "fixture"}\n' "$pack" > "$L/plugins/$pack/.claude-plugin/plugin.json"
+  printf -- '---\nname: %s\ndescription: Fixture skill %s used by the split simulation tests.\n---\n\n# %s\n' "$skill" "$skill" "$skill" \
+    > "$L/plugins/$pack/skills/$skill/SKILL.md"
+done
+
+# push_tree tree bare: first commit of a new repo, unsigned (the "existing unsigned history")
+new_repo() {
+  git init -q --bare "$2"
+  rm -rf "$BASE/work/seed"; cp -a "$1" "$BASE/work/seed"
+  git -C "$BASE/work/seed" init -q
+  commit_as "$3" "$BASE/work/seed" "$4"
+  git -C "$BASE/work/seed" push -q "$2" HEAD:main
+}
+# change bare who message [file]: one more commit on main
+change() {
+  local w="$BASE/work/chg"
+  rm -rf "$w"; git clone -q "$1" "$w"
+  echo "$3" > "$w/${4:-CHANGES}"
+  commit_as "$2" "$w" "$3"
+  git -C "$w" push -q origin HEAD:main
+  git -C "$w" rev-parse HEAD
+}
+github() { python3 - "$FAKE_GH_STATE" "$@" <<'PY'
+import json, sys
+path, op = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+if op == "repo":
+    full, private, url, topics = sys.argv[3], sys.argv[4] == "private", sys.argv[5], sys.argv[6].split(",") if sys.argv[6] else []
+    d["repos"][full] = {"private": private, "owner": full.split("/")[0], "clone_url": url, "topics": topics,
+                        "collaborators": [c for c in sys.argv[7].split(",") if c], "invitations": []}
+elif op == "invite":
+    d["next"] = d.get("next", 0) + 1
+    d["repos"][sys.argv[3]]["invitations"].append({"id": d["next"], "invitee": sys.argv[4]})
+elif op == "has-collaborator":
+    sys.exit(0 if sys.argv[4] in d["repos"][sys.argv[3]]["collaborators"] else 1)
+json.dump(d, open(path, "w"), indent=1)
+PY
+}
+
+# ---------- users ----------
+home() { echo "$BASE/homes/$1"; }
+# as USER cmd…: run with that user's HOME, gh accounts and PATH (rune from ~/.local/bin)
+as() {
+  local h; h="$(home "$1")"; shift
+  (
+    export HOME="$h" PATH="$BASE/fakebin:$h/.local/bin:$PATH" XDG_STATE_HOME="$h/.local/state" XDG_CONFIG_HOME="$h/.config"
+    unset CLAUDE_CONFIG_DIR
+    "$@"
+  )
+}
+# RUNE_TEST_CLIS=0: drop every PATH entry that has claude or opencode, so rune runs as if they were missing
+if [ "$CLIS" != 1 ]; then
+  clean=""
+  IFS=: read -r -a dirs <<< "$PATH"
+  for d in "${dirs[@]}"; do [ -x "$d/claude" ] || [ -x "$d/opencode" ] || clean="${clean:+$clean:}$d"; done
+  export PATH="$clean"
+fi
+user() {
+  local h; h="$(home "$1")"
+  mkdir -p "$h/.local/bin"
+  [ -z "${2:-}" ] || echo "$2" > "$h/.fake-gh-accounts"
+}
+project() {
+  local h; h="$(home "$1")"
+  mkdir -p "$h/$2"
+  git -C "$h/$2" init -q
+  echo '{"vendor": "acme", "name": "store", "builders": {"store": "0.x"}}' > "$h/$2/manifest.json"
+}
+legacy_install() {
+  local h; h="$(home "$1")"
+  user "$1" "$2"
+  git clone -q "$OLD_URL" "$h/runemind"
+  git -C "$h/runemind" config runemind.account "$2"
+  ln -s "$h/runemind/bin/rune" "$h/.local/bin/rune"
+  project "$1" store
+  as "$1" rune setup --quiet
+  (cd "$h/store" && as "$1" rune auto --quiet)
+}
+bootstrap() { as "$1" env RUNEMIND_BOOTSTRAP_ONLY=1 RUNEMIND_ALLOWED_SIGNERS_FILE="$KEYS/allowed_signers" bash "$BASE/src/core/bootstrap.sh"; }
+fresh_install() {
+  local h; h="$(home "$1")"
+  user "$1" "${2:-}"
+  bootstrap "$1" >/dev/null
+  ln -sfn "$h/runemind/bin/rune" "$h/.local/bin/rune"
+  as "$1" rune setup --quiet
+  project "$1" store
+  (cd "$h/store" && as "$1" rune auto --quiet)
+}
+
+# ---------- assertions ----------
+head_is() { [ "$(git -C "$1" rev-parse HEAD)" = "$2" ]; }
+link_to() { [ -L "$1" ] && [ -e "$1" ] && [ "$(readlink "$1")" = "$2" ]; }
+no_broken() { [ -z "$(find "$1" -xtype l 2>/dev/null)" ]; }
+market_has() { python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if any(p["name"]==sys.argv[2] and p["source"]==sys.argv[3] for p in d["plugins"]) else 1)' "$1/.claude-plugin/marketplace.json" "$2" "$3"; }
+market_lacks() { ! grep -q "\"name\": \"$2\"" "$1/.claude-plugin/marketplace.json"; }
+is_core() { [ -f "$1/security/allowed_signers" ] && [ ! -e "$1/grimorio.json" ] && [ -f "$1/bin/rune" ]; }
+contains() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
+not() { ! "$@"; }
+quiet() { "$@" >/dev/null 2>&1; }
+has_invitation() { python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if any(x["invitee"]==sys.argv[3] for x in d["repos"][sys.argv[2]]["invitations"]) else 1)' "$FAKE_GH_STATE" "$1" "$2"; }
+
+echo "== before the split: one private repo with unsigned history"
+new_repo "$L" "$REMOTE/runemind.git" none "old layout (unsigned history)"
+legacy_install owner MarlyAcosta
+legacy_install mate mate
+H="$(home owner)"; M="$(home mate)"
+check "old layout links the skill" link_to "$H/store/.agents/skills/fx-storefront" "$H/runemind/plugins/vtex/skills/fx-storefront"
+L1="$(change "$REMOTE/runemind.git" owner "transitional release")"
+as owner rune update --quiet >/dev/null 2>&1
+check "an owner-signed release is installed" head_is "$H/runemind" "$L1"
+change "$REMOTE/runemind.git" none "unsigned push" EVIL1 >/dev/null
+change "$REMOTE/runemind.git" evil "signed with another key" EVIL2 >/dev/null
+out="$(as owner rune update 2>&1)"
+check "unsigned and foreign-signed commits are not installed" head_is "$H/runemind" "$L1"
+check "... and are reported" contains "$out" "ignoré 2 commit"
+S2="$(change "$REMOTE/runemind.git" owner "owner signs on top")"
+as owner rune update --quiet >/dev/null 2>&1
+check "an owner commit on top installs what is below it" head_is "$H/runemind" "$S2"
+
+echo "== the split: rename to runemind-grimorios, new public core, grimorio-only commit"
+new_repo "$BASE/src/core" "$REMOTE/core.git" owner "public core"
+C1="$(git --git-dir="$REMOTE/core.git" rev-parse main)"
+mv "$REMOTE/runemind.git" "$REMOTE/runemind-grimorios.git"
+mv "$REMOTE/core.git" "$REMOTE/runemind.git"
+w="$BASE/work/grim"; git clone -q "$GRIM_URL" "$w"
+if [ -x "$LIB/scripts/admin/prune-grimorio" ]; then
+  "$LIB/scripts/admin/prune-grimorio" "$w" >/dev/null
+else
+  git -C "$w" rm -r -q -- .
+  mkdir -p "$w/plugins"
+  cp -a "$L/grimorio.json" "$w/"; cp -a "$L/plugins/vtex" "$L/plugins/gestion" "$w/plugins/"
+  echo "# grimorio" > "$w/README.md"
+fi
+commit_as owner "$w" "grimorio only"
+git -C "$w" push -q origin HEAD:main
+G="$(git -C "$w" rev-parse HEAD)"
+github repo MarlyAcosta/runemind public "$OLD_URL" "" ""
+github repo MarlyAcosta/runemind-grimorios private "$GRIM_URL" runemind-grimorio mate
+github invite MarlyAcosta/runemind-grimorios newbie
+change "$REMOTE/runemind.git" none "unsigned core push" CORE_UNSIGNED >/dev/null
+
+echo "== owner: rune update migrates"
+as owner rune update >/dev/null 2>&1 || true
+GD="$H/runemind/grimorios/runemind-grimorios"
+check "the public core took ~/runemind" is_core "$H/runemind"
+check "core at its newest owner-signed commit" head_is "$H/runemind" "$C1"
+check "the old checkout became the grimorio clone" head_is "$GD" "$G"
+check "it tracks the renamed repo" [ "$(git -C "$GD" remote get-url origin)" = "$GRIM_URL" ]
+check "generated marketplace points inside the core" market_has "$H/runemind" vtex ./grimorios/runemind-grimorios/plugins/vtex
+check "project link moved to the grimorio" link_to "$H/store/.agents/skills/fx-storefront" "$GD/plugins/vtex/skills/fx-storefront"
+check "no broken links in the project" no_broken "$H/store/.agents"
+check "global skill relinked" link_to "$H/.agents/skills/fx-pm" "$GD/plugins/gestion/skills/fx-pm"
+check "legacy shims are gone" [ ! -e "$H/runemind/bin/skillpack" ]
+if [ "$CLIS" = 1 ] && has claude; then
+  check "claude plugin validate on the generated marketplace" quiet as owner claude plugin validate "$H/runemind"
+  (cd "$H/store" && as owner timeout 90 claude -p hi --debug-file "$BASE/claude-owner.log" >/dev/null 2>&1) || true
+  check "Claude loads the grimorio skill from the generated marketplace" grep -q "Loaded 1 skills from plugin vtex" "$BASE/claude-owner.log"
+fi
+if [ "$CLIS" = 1 ] && has opencode; then
+  (cd "$H/store" && as owner timeout 120 opencode debug skill > "$BASE/opencode-owner.json" 2>/dev/null) || true
+  check "OpenCode sees the grimorio skill" grep -q '"name": "fx-storefront"' "$BASE/opencode-owner.json"
+fi
+
+echo "== teammate who never updated: the bootstrap migrates (twice: idempotent)"
+bootstrap mate >/dev/null 2>&1 || true
+check "teammate: core in place" is_core "$M/runemind"
+check "teammate: grimorio at the newest signed commit" head_is "$M/runemind/grimorios/runemind-grimorios" "$G"
+check "teammate: project link moved" link_to "$M/store/.agents/skills/fx-storefront" "$M/runemind/grimorios/runemind-grimorios/plugins/vtex/skills/fx-storefront"
+bootstrap mate >/dev/null 2>&1 || true
+check "second bootstrap changes nothing" head_is "$M/runemind/grimorios/runemind-grimorios" "$G"
+check "no leftovers next to ~/runemind" [ -z "$(ls -d "$M"/.runemind-* 2>/dev/null)" ]
+
+echo "== new teammate with a pending invitation"
+fresh_install newbie newbie
+N="$(home newbie)"
+check "invitation accepted by rune" github has-collaborator MarlyAcosta/runemind-grimorios newbie
+check "grimorio cloned at the newest signed commit" head_is "$N/runemind/grimorios/runemind-grimorios" "$G"
+check "core cloned at its newest signed commit" head_is "$N/runemind" "$C1"
+check "skill linked in a VTEX repo" link_to "$N/store/.agents/skills/fx-storefront" "$N/runemind/grimorios/runemind-grimorios/plugins/vtex/skills/fx-storefront"
+
+echo "== outsiders: a GitHub account without access, and no GitHub at all"
+for who in outsider:outsider nogh:; do
+  name="${who%%:*}"; fresh_install "$name" "${who#*:}"
+  O="$(home "$name")"
+  check "$name: working core" is_core "$O/runemind"
+  check "$name: no grimorio" [ ! -d "$O/runemind/grimorios/runemind-grimorios" ]
+  check "$name: rune list says there are no private grimorios" contains "$(as "$name" rune list 2>&1)" "sin grimorios privados"
+  check "$name: nothing grabbed in a VTEX repo" [ ! -e "$O/store/.agents" ]
+  check "$name: marketplace has only public plugins" market_lacks "$O/runemind" vtex
+done
+
+echo "== a collaborator pushes without the owner's signature"
+change "$GRIM_URL" none "unsigned skill change" UNSIGNED >/dev/null
+out="$(as owner rune update 2>&1)"
+check "grimorio stays at the signed commit" head_is "$GD" "$G"
+check "... and the skipped commit is reported" contains "$out" "ignoré 1 commit"
+check "core ignores its unsigned push too" head_is "$H/runemind" "$C1"
+w="$BASE/work/merge"; git clone -q "$GRIM_URL" "$w"
+git -C "$w" switch -q -c feature
+echo feature > "$w/FEATURE"; commit_as none "$w" "unsigned feature"
+git -C "$w" switch -q main
+git -C "$w" -c gpg.format=ssh -c user.signingkey="$KEYS/owner.pub" merge -q --no-ff -S -m "owner merges feature" feature
+git -C "$w" push -q origin HEAD:main
+M2="$(git -C "$w" rev-parse HEAD)"
+as owner rune update --quiet >/dev/null 2>&1
+check "an owner-signed merge installs its unsigned parents" head_is "$GD" "$M2"
+
+echo "== access admin and revocation"
+out="$(as owner rune admin list 2>&1)"
+check "admin list shows collaborators" contains "$out" "newbie"
+as owner rune admin grant friend >/dev/null 2>&1
+check "admin grant sends an invitation" has_invitation MarlyAcosta/runemind-grimorios friend
+as owner rune admin revoke friend >/dev/null 2>&1
+check "admin revoke cancels a pending invitation" not has_invitation MarlyAcosta/runemind-grimorios friend
+as owner rune admin revoke mate >/dev/null 2>&1
+check "admin revoke removes a collaborator" not github has-collaborator MarlyAcosta/runemind-grimorios mate
+as newbie env FAKE_GH_OFFLINE=1 rune update >/dev/null 2>&1 || true
+check "offline update never removes a grimorio" [ -d "$N/runemind/grimorios/runemind-grimorios/.git" ]
+as mate rune update >/dev/null 2>&1 || true
+check "revoked: clone removed" [ ! -e "$M/runemind/grimorios/runemind-grimorios" ]
+check "revoked: project link removed" [ ! -e "$M/store/.agents/skills/fx-storefront" ]
+check "revoked: Claude enablement dropped" not grep -qs 'vtex@runemind' "$M/store/.claude/settings.local.json"
+check "revoked: global skill unlinked" [ ! -e "$M/.agents/skills/fx-pm" ]
+check "revoked: plugins gone from the marketplace" market_lacks "$M/runemind" vtex
+
+[ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }
+echo "all split checks passed"

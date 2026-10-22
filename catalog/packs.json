@@ -1,0 +1,92 @@
+{
+  "schema": 3,
+  "grimorio_owners": [
+    "MarlyAcosta"
+  ],
+  "sources": {
+    "vtex-docs": {
+      "repo": "https://github.com/vtexdocs/ai-skills.git",
+      "ref": "v1.11.0",
+      "path": "skills"
+    }
+  },
+  "packs": [
+    {
+      "id": "faststore",
+      "claude_name": "faststore",
+      "dir": "plugins/faststore",
+      "skills": [
+        {
+          "source": "vtex-docs",
+          "skills": [
+            "faststore-storefront"
+          ]
+        }
+      ],
+      "mode": "auto",
+      "label": "VTEX FastStore",
+      "description": "storefront FastStore",
+      "marketplace": {
+        "description": "Official VTEX FastStore storefront skill"
+      },
+      "detect": {
+        "package_deps": [
+          "@faststore/core",
+          "@faststore/cli"
+        ],
+        "files": [
+          "faststore.config.js",
+          "discovery.config.js"
+        ]
+      }
+    },
+    {
+      "id": "shopify",
+      "claude_name": "shopify-plugin",
+      "vendor": {
+        "repo": "https://github.com/Shopify/Shopify-AI-Toolkit.git",
+        "path": "skills"
+      },
+      "mode": "auto",
+      "label": "Shopify",
+      "description": "toolkit oficial de Shopify",
+      "marketplace": {
+        "description": "Official Shopify AI Toolkit (docs search, GraphQL/Liquid validation)",
+        "source": {
+          "source": "github",
+          "repo": "Shopify/Shopify-AI-Toolkit"
+        }
+      },
+      "detect": {
+        "files": [
+          "shopify.app.toml",
+          "layout/theme.liquid"
+        ],
+        "dirs_all": [
+          "sections",
+          "snippets"
+        ],
+        "package_deps": [
+          "@shopify/hydrogen*",
+          "@shopify/shopify-app*",
+          "@shopify/cli*"
+        ]
+      }
+    },
+    {
+      "id": "custom",
+      "claude_name": "custom",
+      "dir": "plugins/custom",
+      "skills": [],
+      "mode": "auto",
+      "label": "desarrollo a la medida",
+      "description": "tus convenciones para desarrollos a la medida",
+      "marketplace": {
+        "description": "Conventions for custom development"
+      },
+      "detect": {
+        "fallback": true
+      }
+    }
+  ]
+}

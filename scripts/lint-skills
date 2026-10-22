@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Lint the skills of every local pack: the core catalog plus every grimorio (see lib/catalog.py).
+
+Checks: each own skill folder has a SKILL.md with frontmatter, `name` equals the folder name, `description`
+is present and of sane length, and every `related:` entry names a skill of some pack (own or upstream).
+Upstream skills are checked at their pinned ref: the source is cloned into .vendor if missing (the same clone
+rune uses), each listed skill must exist there with a matching `name`. The catalog itself (unique names, own
+folders listed) is validated by lib/catalog.py. With --cross-pack, also lists `related:` entries that point
+into another pack (warnings only). Run with `python3 -I scripts/lint-skills`. Standard library only; 3.8+.
+"""
+
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.dont_write_bytecode = True  # no lib/__pycache__ in the working tree
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+import catalog  # noqa: E402  (lib/catalog.py)
+
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+KEY_RE = re.compile(r"^([A-Za-z0-9_-]+):(.*)$")
+NAME_MAX = 64
+DESC_MIN, DESC_MAX = 20, 1024
+
+
+def frontmatter(path):
+    """Top-level `key: value` pairs of a SKILL.md frontmatter (folded/indented continuations joined)."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("missing frontmatter (first line must be ---)")
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        raise ValueError("frontmatter is not closed with ---")
+    fields, key = {}, None
+    for line in lines[1:end]:
+        m = KEY_RE.match(line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            fields[key] = "" if val in (">", "|", ">-", "|-", ">+", "|+") else unquote(val)
+        elif key and line.strip():
+            fields[key] = (fields[key] + " " + line.strip()).strip()
+    return fields
+
+
+def unquote(val):
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+        return val[1:-1]
+    return val
+
+
+def related(val):
+    val = val.strip()
+    if val.startswith("[") and val.endswith("]"):
+        val = val[1:-1]
+    return [unquote(x.strip()) for x in val.split(",") if x.strip()]
+
+
+def lint_own(pack, d, errors):
+    folder = os.path.join(pack["_root"], pack["dir"], "skills", d)
+    rel = os.path.relpath(os.path.join(folder, "SKILL.md"), ROOT)
+    try:
+        fm = frontmatter(os.path.join(folder, "SKILL.md"))
+    except (OSError, ValueError) as e:
+        errors.append("%s: %s" % (rel, e))
+        return rel, []
+    name, desc = fm.get("name", ""), fm.get("description", "")
+    if name != d:
+        errors.append("%s: name '%s' must equal the folder name '%s'" % (rel, name, d))
+    if not NAME_RE.match(d) or len(d) > NAME_MAX:
+        errors.append("%s: folder name must be lowercase-hyphenated, at most %d chars" % (rel, NAME_MAX))
+    if not DESC_MIN <= len(desc) <= DESC_MAX:
+        errors.append("%s: description must be %d-%d chars (has %d)" % (rel, DESC_MIN, DESC_MAX, len(desc)))
+    return rel, related(fm.get("related", ""))
+
+
+def lint_upstream(sid, src, s, errors):
+    rel = "%s@%s:%s/%s/SKILL.md" % (sid, src["ref"], src["path"], s)
+    path = os.path.join(catalog.source_dir(sid, src), src["path"], s, "SKILL.md")
+    try:
+        fm = frontmatter(path)
+    except OSError:
+        errors.append("%s: listed in catalog/packs.json but missing at the pinned ref" % rel)
+        return rel, []
+    except ValueError as e:
+        errors.append("%s: %s" % (rel, e))
+        return rel, []
+    if fm.get("name", "") != s:
+        errors.append("%s: name '%s' must equal the folder name '%s'" % (rel, fm.get("name", ""), s))
+    return rel, related(fm.get("related", ""))
+
+
+def main(argv):
+    cross = "--cross-pack" in argv
+    data = catalog.load_data(strict=True)
+    sources = data.get("sources", {})
+    packs = [p for p in data["packs"] if "dir" in p]
+    errors, warnings, skills = [], [], {}
+    ready = {}
+    for sid in sorted({sid for p in packs for sid, _ in catalog.upstream(p)}):
+        try:
+            if catalog.fetch(sid, sources[sid]) != catalog.OK:
+                errors.append("source '%s': cannot clone %s at %s (needed to check upstream skills)"
+                              % (sid, sources[sid]["repo"], sources[sid]["ref"]))
+        except catalog.CatalogError as e:
+            errors.append(str(e))
+        ready[sid] = catalog.source_ready(sid, sources[sid])
+    for pack in packs:
+        for d in catalog.own(pack):
+            rel, refs = lint_own(pack, d, errors)
+            skills[d] = (pack["id"], rel, refs, True)
+        for sid, s in catalog.upstream(pack):
+            if ready[sid]:
+                rel, refs = lint_upstream(sid, sources[sid], s, errors)
+            else:
+                rel, refs = "%s@%s:%s" % (sid, sources[sid]["ref"], s), []
+            skills[s] = (pack["id"], rel, refs, False)
+    for name, (pack, rel, refs, is_own) in sorted(skills.items()):
+        for ref in refs:
+            if ref not in skills:
+                if is_own:
+                    errors.append("%s: related skill '%s' is not in any pack" % (rel, ref))
+                elif cross:
+                    warnings.append("%s: related skill '%s' is not in any pack" % (rel, ref))
+            elif cross and skills[ref][0] != pack:
+                warnings.append("%s: related skill '%s' is in pack '%s', not '%s'" % (rel, ref, skills[ref][0], pack))
+    for msg in warnings:
+        print("warn: " + msg)
+    for msg in errors:
+        print("error: " + msg)
+    n_own = sum(1 for v in skills.values() if v[3])
+    print("%d skills (%d own, %d upstream), %d error(s)%s" % (
+        len(skills), n_own, len(skills) - n_own, len(errors), ", %d warning(s)" % len(warnings) if cross else ""))
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

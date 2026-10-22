@@ -1,0 +1,679 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_self() {
+  local p="$1" t
+  while [ -L "$p" ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  echo "$p"
+}
+
+LIB="$(cd "$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")/.." && pwd)"
+MARKET="runemind"
+VENDOR="$LIB/.vendor"
+CATALOG_PY="$LIB/lib/catalog.py"
+CATALOG=""
+US=$'\x1f'
+PORT=7421
+DECK_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/deck/config.json"
+VERSION="1.0.0"
+
+QUIET=0
+HOOK=0
+
+# shellcheck source=../lib/ui.sh
+. "$LIB/lib/ui.sh"
+# shellcheck source=../lib/grimorios.sh
+. "$LIB/lib/grimorios.sh"
+trap 'rm_cursor_show' EXIT
+
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+die() { printf '  %s %s\n' "$(rm_c "$P_RED" "$G_FAIL")" "$*" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  local ids
+  ids="$(pack_ids "auto manual" | tr '\n' ' ')"; ids="${ids% }"
+  rm_head "rune" "Runemind $VERSION"
+  rm_root "$G_ROOT"
+  rm_branch "$(rm_strong "rune")                     $(rm_dim "estado del proyecto actual")"
+  rm_branch "$(rm_strong "rune use") $(rm_dim "<grimorio…>")     $(rm_dim "graba grimorios en este repo (${ids// /, })")"
+  rm_branch "$(rm_strong "rune off") $(rm_dim "<grimorio…>")     $(rm_dim "los quita")"
+  rm_branch "$(rm_strong "rune auto")                $(rm_dim "detecta el tipo de proyecto y graba lo que corresponde")"
+  rm_branch "$(rm_strong "rune list")                $(rm_dim "grimorios disponibles")"
+  rm_branch "$(rm_strong "rune remote") $(rm_dim "on|off|status|pair|devices|revoke")  $(rm_dim "deck en tu celular")"
+  rm_branch "$(rm_strong "rune install")             $(rm_dim "corre el instalador")"
+  rm_branch "$(rm_strong "rune update")              $(rm_dim "núcleo, grimorios privados y skills de VTEX (solo commits firmados por el dueño)")"
+  rm_branch "$(rm_strong "rune setup")               $(rm_dim "descubre tus grimorios y registra el marketplace")"
+  rm_branch "$(rm_strong "rune admin") $(rm_dim "grant|revoke|list")  $(rm_dim "acceso de tu equipo a tu grimorio (dueño)")"
+  rm_last "$(rm_strong "rune log")                 $(rm_dim "detalle de la última instalación")"
+}
+
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || die "no estás dentro de un repositorio git"; }
+
+# ---------- catalog (catalog/packs.json via lib/catalog.py) ----------
+
+load_catalog() {
+  CATALOG="$(python3 -I "$CATALOG_PY" table)" || die "el catálogo no es válido (revisa: python3 -I lib/catalog.py validate)"
+}
+
+# the Claude marketplace is generated from the merged catalog (core + grimorios)
+ensure_marketplace() { python3 -I "$CATALOG_PY" write-marketplace || true; }
+
+# pack_get <pack> <column>: 1 id, 2 claude_name, 3 mode, 4 link prefix (every skill link of the pack points
+# inside it: <repo>/plugins/<pack> or the vendor clone), 5 skill count, 6 vendor dir, 7 vendor repo, 8 label,
+# 9 description, 10 grimorio ("" for the core), 11 legacy prefix (the pack's path in the single-repo layout)
+pack_get() { printf '%s\n' "$CATALOG" | awk -F "$US" -v id="$1" -v col="$2" '$1 == id { print $col; found = 1 } END { exit !found }'; }
+pack_ids() { printf '%s\n' "$CATALOG" | awk -F "$US" -v modes=" ${1:-} " 'modes == "  " || index(modes, " " $3 " ") { print $1 }'; }
+pack_known() { pack_get "$1" 1 >/dev/null; }
+pack_mode() { pack_get "$1" 3; }
+pack_label() { pack_get "$1" 8; }
+# a pack with no skills and nothing to clone is never installed
+pack_empty() { [ -z "$(pack_get "$1" 6)" ] && [ "$(pack_get "$1" 5)" = 0 ]; }
+
+claude_name() { pack_get "$1" 2 || echo "$1"; }
+pack_prefix() { pack_get "$1" 4 || echo "$LIB/plugins/$1"; }
+pack_legacy() { pack_get "$1" 11 || true; }
+# pack_skills <pack…>: one line per skill, "pack<TAB>name<TAB>link target"
+pack_skills() { [ $# -eq 0 ] || python3 -I "$CATALOG_PY" skills "$@"; }
+
+ensure_vendor() {
+  local dir repo
+  dir="$(pack_get "$1" 6)"
+  [ -n "$dir" ] || return 0
+  repo="$(pack_get "$1" 7)"
+  if [ ! -d "$dir/.git" ]; then
+    mkdir -p "$VENDOR"
+    git clone --quiet --depth 1 "$repo" "$dir"
+  fi
+  if [ "$1" = shopify ]; then
+    mkdir -p "$HOME/.config/shopify-ai-toolkit"
+    touch "$HOME/.config/shopify-ai-toolkit/opt-out"
+  fi
+}
+
+# ensure_upstream <pack>: copy the pack's upstream skills (catalog "sources", e.g. vtexdocs/ai-skills at its
+# pinned tag) into plugins/<pack>/upstream, cloning the source into .vendor/<source>@<ref> only when missing.
+# Prints why on failure; the pack's own skills keep working without them.
+ensure_upstream() {
+  local err st=0
+  err="$(python3 -I "$CATALOG_PY" sync "$1" 2>&1)" || st=$?
+  if [ "$st" = 4 ]; then
+    st=0
+    err="$(python3 -I "$CATALOG_PY" fetch 2>&1 && python3 -I "$CATALOG_PY" sync "$1" 2>&1)" || st=$?
+  fi
+  [ "$st" = 0 ] || printf '%s\n' "$err" | sed 's/^catalog: //' | tail -n 1
+  return "$st"
+}
+
+upstream_warn() {
+  [ "$QUIET" = 1 ] && return 0
+  rm_warn "grimorio $1: no pude traer sus skills oficiales de VTEX (vtexdocs/ai-skills); quedan solo las propias"
+  [ -z "$2" ] || rm_info "$(rm_dim "$2")"
+  rm_info "con conexión, vuelve a correr: $(rm_strong "rune use $1")"
+}
+
+settings_has() {
+  local f="$1/.claude/settings.local.json" key="$2"
+  [ -f "$f" ] || return 1
+  python3 - "$f" "$key" <<'EOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("enabledPlugins", {}).get(sys.argv[2]) else 1)
+EOF
+}
+
+settings_drop() {
+  local f="$1/.claude/settings.local.json" key="$2"
+  [ -f "$f" ] || return 0
+  python3 - "$f" "$key" <<'EOF'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+d.get("enabledPlugins", {}).pop(key, None)
+if not d.get("enabledPlugins"):
+    d.pop("enabledPlugins", None)
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+EOF
+}
+
+claude_enabled() { settings_has "$1" "$2@$MARKET"; }
+
+EX_ROOT=""
+EX_FILE=""
+# exclude_file root: sets EX_FILE to the repo's info/exclude (remembered per repo; a grimorio links dozens of skills)
+exclude_file() {
+  [ "$EX_ROOT" = "$1" ] && return 0
+  local ex
+  ex="$(git -C "$1" rev-parse --git-path info/exclude)"
+  case "$ex" in /*) ;; *) ex="$1/$ex" ;; esac
+  mkdir -p "$(dirname "$ex")"; touch "$ex"
+  EX_ROOT="$1"; EX_FILE="$ex"
+}
+exclude_add() { exclude_file "$1"; grep -qxF -- "$2" "$EX_FILE" || printf '%s\n' "$2" >> "$EX_FILE"; }
+exclude_remove() {
+  exclude_file "$1"
+  grep -vxF -- "$2" "$EX_FILE" > "$EX_FILE.tmp" || true
+  mv "$EX_FILE.tmp" "$EX_FILE"
+}
+
+# link_targets root: where every .agents/skills link points, one per line
+link_targets() {
+  local link
+  for link in "$1/.agents/skills"/*; do
+    [ -L "$link" ] && readlink "$link"
+  done
+  return 0
+}
+
+links_into() {
+  # links_into root pack [skills] -> how many of the pack's skills are linked (and resolve) in .agents/skills;
+  # skills is pack_skills output, read from the catalog when omitted
+  local root="$1" pack="$2" list="${3:-}" n=0 p name target link
+  [ -d "$root/.agents/skills" ] || { echo 0; return; }
+  [ -n "$list" ] || list="$(pack_skills "$pack")"
+  while IFS=$'\t' read -r p name target; do
+    [ "$p" = "$pack" ] || continue
+    link="$root/.agents/skills/$name"
+    [ -L "$link" ] && [ -e "$link" ] || continue
+    [ "$(readlink "$link")" = "$target" ] && n=$((n + 1))
+  done <<< "$list"
+  echo "$n"
+}
+
+# has_links pack targets -> any link target (link_targets output; broken links count) points into the pack
+has_links() {
+  local src legacy target
+  src="$(pack_prefix "$1")"; legacy="$(pack_legacy "$1")"
+  while IFS= read -r target; do
+    case "$target" in "$src"/*) return 0 ;; esac
+    [ -n "$legacy" ] && case "$target" in "$legacy"/*) return 0 ;; esac
+  done <<< "$2"
+  return 1
+}
+
+# prune_links root: drop broken .agents/skills links into the library (skills that moved to another pack or
+# were removed); link_pack recreates the ones that still exist
+prune_links() {
+  local root="$1" link
+  [ -d "$root/.agents/skills" ] || return 0
+  for link in "$root/.agents/skills"/*; do
+    [ -L "$link" ] && [ ! -e "$link" ] || continue
+    case "$(readlink "$link")" in
+      "$LIB"/*)
+        rm -- "$link"
+        exclude_remove "$root" "/.agents/skills/$(basename "$link")"
+        ;;
+    esac
+  done
+}
+
+link_pack() {
+  local root="$1" pack="$2" name skill target
+  prune_links "$root"
+  while IFS=$'\t' read -r _ name skill; do
+    [ -n "$name" ] && [ -f "$skill/SKILL.md" ] || continue
+    mkdir -p "$root/.agents/skills"
+    target="$root/.agents/skills/$name"
+    if [ -e "$target" ] && [ ! -L "$target" ]; then
+      [ "$QUIET" = 1 ] || rm_warn "$name: .agents/skills ya tiene una carpeta propia con ese nombre; no la toco"
+      continue
+    fi
+    ln -sfn "$skill" "$target"
+    exclude_add "$root" "/.agents/skills/$name"
+  done <<< "$(pack_skills "$pack")"
+}
+
+unlink_pack() {
+  local root="$1" pack="$2" src legacy link target
+  src="$(pack_prefix "$pack")"
+  legacy="$(pack_legacy "$pack")"; legacy="${legacy:-$src}"
+  [ -d "$root/.agents/skills" ] || return 0
+  for link in "$root/.agents/skills"/*; do
+    [ -L "$link" ] || continue
+    target="$(readlink "$link")"
+    case "$target" in
+      "$src"/*|"$legacy"/*)
+        rm -- "$link"
+        [ "$root" = "$HOME" ] || exclude_remove "$root" "/.agents/skills/$(basename "$link")"
+        ;;
+    esac
+  done
+  rmdir "$root/.agents/skills" 2>/dev/null && rmdir "$root/.agents" 2>/dev/null || true
+}
+
+ACTIVATED=""
+
+use_pack() {
+  local root="$1" pack="$2" name n src why
+  pack_known "$pack" || die "no conozco el grimorio '$pack' (mira: rune list)"
+  if [ "$(pack_mode "$pack")" = global ]; then
+    [ "$QUIET" = 1 ] || rm_info "$(pack_label "$pack") es global: se instala con 'rune setup'"
+    return 0
+  fi
+  if pack_empty "$pack"; then
+    src="$(pack_prefix "$pack")/skills"
+    [ "$QUIET" = 1 ] || rm_info "el grimorio $pack todavía no tiene runas: agrega skills en ${src#"$LIB"/}, anótalas en su catálogo y vuelve a correr rune use $pack"
+    return 0
+  fi
+  ensure_vendor "$pack"
+  why="$(ensure_upstream "$pack")" || upstream_warn "$pack" "$why"
+  name="$(claude_name "$pack")"
+  if has claude && ! claude_enabled "$root" "$name"; then
+    # a grimorio added in a library update is unknown to Claude until the marketplace is refreshed
+    claude_install "$root" "$name" \
+      || { claude plugin marketplace update "$MARKET" >/dev/null 2>&1 && claude_install "$root" "$name"; } \
+      || die "Claude no pudo instalar $name@$MARKET (corre: rune setup)"
+    exclude_add "$root" "/.claude/settings.local.json"
+    ACTIVATED="$ACTIVATED $pack"
+  fi
+  link_pack "$root" "$pack"
+  register_project "$root"
+  [ "$QUIET" = 1 ] && return 0
+  n="$(links_into "$root" "$pack")"
+  rm_line "  $(rm_gold "$G_STAR") $(rm_grad "grimorio $pack grabado") $(rm_dim "· $n runas en Claude y OpenCode")"
+}
+
+claude_install() { (cd "$1" && claude plugin install "$2@$MARKET" --scope local >/dev/null 2>&1); }
+
+# refresh_pack root pack: a grimorio already in this repo gets its current skills (new upstream pin, skills
+# that moved between packs) without touching Claude
+refresh_pack() {
+  local why
+  why="$(ensure_upstream "$2")" || upstream_warn "$2" "$why"
+  link_pack "$1" "$2"
+  register_project "$1"
+}
+
+off_pack() {
+  local root="$1" pack="$2" name
+  name="$(claude_name "$pack")"
+  if has claude && claude_enabled "$root" "$name"; then
+    (cd "$root" && claude plugin uninstall "$name@$MARKET" --scope local >/dev/null 2>&1) || settings_drop "$root" "$name@$MARKET"
+  fi
+  unlink_pack "$root" "$pack"
+  [ "$QUIET" = 1 ] || rm_line "  $(rm_dim "$G_SKIP") grimorio $pack quitado de $(basename "$root")"
+}
+
+# detect <root>: packs whose detect rules in catalog/packs.json match (the fallback pack if none)
+detect() { python3 -I "$CATALOG_PY" detect "$1"; }
+
+kind_label() {
+  local p out=""
+  for p in $1; do out="${out:+$out + }$(pack_label "$p")"; done
+  echo "${out:-desarrollo a la medida}"
+}
+
+ts_connected() { has tailscale && tailscale status >/dev/null 2>&1; }
+remote_published() { ts_connected && tailscale serve status 2>/dev/null | grep -q "127.0.0.1:$PORT"; }
+
+cmd_status() {
+  local root kind pack name n line skills
+  root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -z "$root" ]; then
+    rm_head "Runemind $VERSION" "fuera de un repositorio"
+    rm_root "$G_ROOT"
+    rm_branch "$(rm_dim "entra a un proyecto y corre") $(rm_strong "rune") $(rm_dim "para ver sus grimorios")"
+    if remote_published; then rm_last "$(rm_gold "ᛖ") celular  $(rm_c "$P_GREEN" "despierto")"; else rm_last "$(rm_dim "ᛖ celular dormido · rune remote on")"; fi
+    return 0
+  fi
+  kind="$(detect "$root")"
+  rm_line "  $(rm_gold "$G_ROOT") $(rm_grad "$(basename "$root")")  $(rm_dim "· $(kind_label "$kind")")"
+  rm_root "$G_TODO"
+  local any=0
+  # shellcheck disable=SC2046
+  skills="$(pack_skills $(pack_ids "auto manual"))"
+  for pack in $(pack_ids "auto manual"); do
+    name="$(claude_name "$pack")"
+    n="$(links_into "$root" "$pack" "$skills")"
+    if claude_enabled "$root" "$name" || [ "$n" -gt 0 ]; then
+      any=1
+      rm_branch "$(rm_done_txt "grimorio $pack" "$n runas · Claude $(claude_enabled "$root" "$name" && echo sí || echo no) · OpenCode $([ "$n" -gt 0 ] && echo sí || echo no)")"
+    fi
+  done
+  [ "$any" = 1 ] || rm_branch "$(rm_todo_txt "sin grimorios" "rune auto los graba según el proyecto")"
+  if [ -f "$DECK_CONFIG" ]; then
+    line="$(python3 - "$DECK_CONFIG" <<'PY' 2>/dev/null || true
+import json, re, sys
+c = json.load(open(sys.argv[1])).get("crossRunner", {})
+m = c.get("members", {}).get("lead", {})
+if c.get("enabled") and m:
+    model = m.get("modelId", "")
+    hit = re.match(r"claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)", model)
+    if hit:
+        model = f"Claude {hit.group(1).capitalize()} {hit.group(2)}.{hit.group(3)}"
+    else:
+        model = f"{m.get('runnerId', '')} {model.split('/')[-1]}".strip()
+    print(f"{model} lidera · {len(c.get('members', {}))} roles")
+PY
+)"
+    [ -n "$line" ] && rm_branch "$(rm_gold "ᛞ") deck  $(rm_dim "$line")"
+  fi
+  if [ -f "$root/.nvmrc" ]; then rm_branch "$(rm_gold "ᚦ") node  $(node -v 2>/dev/null || echo '?') $(rm_dim "(.nvmrc pide $(tr -d '[:space:]' < "$root/.nvmrc"))")"
+  else rm_branch "$(rm_gold "ᚦ") node  $(node -v 2>/dev/null || echo '?')"; fi
+  if remote_published; then rm_last "$(rm_gold "ᛖ") celular  $(rm_c "$P_GREEN" "despierto")"
+  else rm_last "$(rm_dim "ᛖ celular dormido · rune remote on")"; fi
+}
+
+cmd_list() {
+  rm_head "Grimorios"
+  rm_root "$G_TODO"
+  local id mode n vdir desc text pad last
+  last="$(pack_ids | tail -n 1)"
+  while IFS="$US" read -r id _ mode _ n vdir _ _ desc _; do
+    if [ "$mode" = global ]; then text="global · $desc"
+    elif [ -n "$vdir" ]; then text="$desc"
+    elif [ "$mode" = manual ]; then text="$n runas · a mano · $desc"
+    else text="$n runas · $desc"; fi
+    pad="$(printf '%*s' $(( ${#id} < 15 ? 17 - ${#id} : 2 )) '')"
+    if [ "$id" = "$last" ]; then rm_last "$(rm_strong "$id")$pad$(rm_dim "$text")"
+    else rm_branch "$(rm_strong "$id")$pad$(rm_dim "$text")"; fi
+  done <<< "$CATALOG"
+  local g
+  g="$(python3 -I "$CATALOG_PY" grimorios | cut -f1 | tr '\n' ' ')"
+  if [ -n "${g// /}" ]; then rm_info "grimorios privados: ${g% }"
+  else rm_info "sin grimorios privados: pide acceso al dueño y corre rune update"; fi
+}
+
+cmd_auto() {
+  local root pack found targets
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+  case "$root" in "$LIB"|"$LIB"/*) exit 0 ;; esac
+  ensure_marketplace
+  found=" $(detect "$root") "
+  targets="$(link_targets "$root")"
+  for pack in $found; do
+    pack_empty "$pack" || use_pack "$root" "$pack"
+  done
+  # grimorios grabbed earlier that detection no longer picks (manual ones, or vtex-extra in FastStore repos
+  # from before the faststore grimorio) stay until `rune off`, with their current skills
+  for pack in $(pack_ids "auto manual"); do
+    case "$found" in *" $pack "*) continue ;; esac
+    if has_links "$pack" "$targets" || claude_enabled "$root" "$(claude_name "$pack")"; then
+      pack_empty "$pack" || refresh_pack "$root" "$pack"
+    fi
+  done
+  if [ "$HOOK" = 1 ] && [ -n "$ACTIVATED" ]; then
+    printf '{"systemMessage": "Runemind grabó el grimorio%s en este repo. Reinicia la sesión para cargarlo."}\n' "$ACTIVATED"
+  fi
+}
+
+lib_repo() {
+  local url
+  url="$(git -C "$LIB" remote get-url origin 2>/dev/null)" || return 0
+  case "$url" in *github.com[:/]*) printf '%s\n' "$url" | sed -E 's#^(https://([^@/]+@)?github\.com/|git@github\.com:)##; s#\.git$##' ;; esac
+}
+
+# lib_account: in the single-repo layout the library itself is private; pick a gh account that can read it
+lib_account() {
+  local repo a
+  repo="$(lib_repo)"
+  [ -n "$repo" ] || return 1
+  for a in $(git -C "$LIB" config runemind.account 2>/dev/null || true) $(gh_accounts); do
+    gh_as "$a" api "repos/$repo" --silent >/dev/null 2>&1 || continue
+    set_clone_auth "$LIB" "$a"
+    return 0
+  done
+  return 1
+}
+
+cmd_update() {
+  local mode="${1:-}" before
+  case "$mode" in
+    --adopt) adopt_legacy "${2:-}" ;;
+    --continue) ;;
+    *)
+      rm_head "Actualizando Runemind"
+      rm_root "$G_ROOT"
+      if is_legacy; then
+        if legacy_split_detected; then legacy_migrate || true; fi
+        if has gh && [ -n "$(lib_repo)" ] && ! lib_account; then warn "ninguna de tus cuentas de gh puede leer $(lib_repo)"; fi
+      fi
+      before="$(git -C "$LIB" rev-parse HEAD 2>/dev/null || true)"
+      signed_pull "$LIB" "$(is_legacy && echo biblioteca || echo núcleo)" || true
+      # continue with the code just installed
+      if [ "$(git -C "$LIB" rev-parse HEAD 2>/dev/null || true)" != "$before" ]; then
+        exec "$LIB/bin/rune" update --continue ${QUIET_FLAG[@]+"${QUIET_FLAG[@]}"}
+      fi
+      ;;
+  esac
+  adopt_leftovers
+  load_catalog
+  is_legacy || sync_grimorios
+  load_catalog
+  ensure_marketplace
+  rm_run "skills oficiales de VTEX ($(source_refs))" "" -- refresh_sources || true
+  if [ -d "$VENDOR/Shopify-AI-Toolkit/.git" ]; then rm_run "toolkit de Shopify" "" -- git -C "$VENDOR/Shopify-AI-Toolkit" pull --ff-only --quiet || true; fi
+  if has claude; then rm_run "marketplace de Claude" "" -- claude plugin marketplace update "$MARKET" || true; fi
+  install_globals
+  relink_projects
+  report_newer_sources
+}
+
+source_refs() { python3 -I "$CATALOG_PY" sources | awk -F '\t' '{ printf "%s%s", sep, $3; sep = ", " }'; }
+
+# the pinned tags (catalog/packs.json "sources") already in use are re-checked and copied into every
+# <repo>/plugins/<pack>/upstream; the pin itself only changes by editing the catalog
+refresh_sources() {
+  local st=0
+  python3 -I "$CATALOG_PY" fetch --refresh --present || st=$?
+  [ "$st" = 4 ] && return 1
+  python3 -I "$CATALOG_PY" sync --all --present
+}
+
+report_newer_sources() {
+  local sid ref newest
+  while IFS=$'\t' read -r sid ref newest; do
+    [ -n "$newest" ] || continue
+    rm_info "$sid tiene $(rm_strong "$newest") (fijado en $ref): para subirlo cambia \"ref\" en catalog/packs.json, corre python3 -I scripts/lint-skills y rune update"
+  done <<< "$(python3 -I "$CATALOG_PY" outdated --present 2>/dev/null || true)"
+}
+
+# install_globals: global packs (gestion) go to Claude at user scope and to ~/.agents/skills
+install_globals() {
+  local pack name skill why
+  for pack in $(pack_ids global); do
+    why="$(ensure_upstream "$pack")" || upstream_warn "$pack" "$why"
+    if has claude; then claude plugin install "$(claude_name "$pack")@$MARKET" --scope user >/dev/null 2>&1 || true; fi
+    mkdir -p "$HOME/.agents/skills"
+    while IFS=$'\t' read -r _ name skill; do
+      [ -n "$name" ] && [ -f "$skill/SKILL.md" ] || continue
+      ln -sfn "$skill" "$HOME/.agents/skills/$name"
+    done <<< "$(pack_skills "$pack")"
+  done
+}
+
+cmd_setup() {
+  local g
+  adopt_leftovers
+  is_legacy || sync_grimorios
+  load_catalog
+  ensure_marketplace
+  if has claude; then
+    if claude plugin marketplace list 2>/dev/null | grep -qw "$MARKET"; then
+      claude plugin marketplace update "$MARKET" >/dev/null 2>&1 || true
+    else
+      claude plugin marketplace add "$LIB" >/dev/null
+    fi
+  fi
+  install_globals
+  g="$(python3 -I "$CATALOG_PY" grimorios | cut -f1 | tr '\n' ' ')"
+  if [ -n "${g// /}" ]; then say "  $(rm_gold "$G_STAR") $(rm_grad "marketplace $MARKET listo") $(rm_dim "· grimorios privados: ${g% }")"
+  else say "  $(rm_gold "$G_STAR") $(rm_grad "marketplace $MARKET listo") $(rm_dim "· solo el núcleo público (sin grimorios privados accesibles)")"; fi
+}
+
+# ---------- remote ----------
+
+need_tailscale() {
+  has tailscale || die "Tailscale no está instalado: corre 'rune install' y marca 'Acceso desde el celular'"
+  tailscale status >/dev/null 2>&1 || die "Tailscale no está conectado: corre 'sudo tailscale up'"
+}
+
+ts_origin() {
+  tailscale status --json | python3 -c 'import json,sys;n=json.load(sys.stdin)["Self"]["DNSName"].rstrip(".");print("https://"+n if n else "")'
+}
+
+funnel_on() { tailscale funnel status 2>/dev/null | grep -qiE 'funnel on'; }
+
+set_deck_web() {
+  local origin="$1" auto="$2"
+  [ -f "$DECK_CONFIG" ] || die "no existe $DECK_CONFIG; activa Cross runner en deck primero"
+  cp -p "$DECK_CONFIG" "$DECK_CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+  python3 - "$DECK_CONFIG" "$origin" "$auto" "$PORT" <<'EOF'
+import json, sys
+path, origin, auto, port = sys.argv[1], sys.argv[2], sys.argv[3] == "1", int(sys.argv[4])
+with open(path) as f:
+    data = json.load(f)
+cross = data.get("crossRunner")
+if not isinstance(cross, dict):
+    sys.exit("crossRunner no está configurado; actívalo en deck → Start installation → Cross runner")
+web = cross.setdefault("web", {})
+web["port"] = port
+web["allowFunnel"] = False
+if origin:
+    web["trustedProxy"] = "127.0.0.1"
+    web["allowedOrigins"] = [origin]
+    web["tailscaleServeAccess"] = auto
+else:
+    web["trustedProxy"] = None
+    web["allowedOrigins"] = []
+    web["tailscaleServeAccess"] = False
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+EOF
+}
+
+restart_daemon() {
+  if deck daemon status --json 2>/dev/null | grep -q '"running": *true'; then
+    deck daemon restart >/dev/null 2>&1 || die "deck no se pudo reiniciar (¿hay tareas o aprobaciones pendientes?). Termínalas y corre: deck daemon restart"
+  fi
+}
+
+remote_on() {
+  local auto=0 origin out status=0 link
+  [ "${1:-}" = "--auto" ] && auto=1
+  need_tailscale
+  funnel_on && die "Tailscale Funnel está encendido y expondría deck a internet. Apágalo con: tailscale funnel reset"
+  origin="$(ts_origin)"
+  [ -n "$origin" ] || die "no pude leer el nombre de este equipo en Tailscale (¿MagicDNS activado?)"
+  out="$(timeout 30 tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ]; then
+    link="$(printf '%s\n' "$out" | grep -oE 'https://login\.tailscale\.com/[^[:space:]]+' | head -1 || true)"
+    if [ -n "$link" ]; then
+      rm_seal "Falta un permiso en Tailscale" "Tailscale necesita que actives algo en tu red:" "$(rm_blue "$link")" "ábrelo, apruébalo y vuelve a correr: $(rm_strong "rune remote on")"
+      exit 1
+    fi
+    if printf '%s\n' "$out" | grep -qi 'access denied'; then
+      rm_seal "Falta un permiso en Tailscale" "tu usuario todavía no puede publicar servicios" "dale permiso una vez: $(rm_strong 'sudo tailscale set --operator=$USER')" "y vuelve a correr: $(rm_strong "rune remote on")"
+      exit 1
+    fi
+    printf '%s\n' "$out" >&2
+    die "tailscale serve falló"
+  fi
+  set_deck_web "$origin" "$auto"
+  restart_daemon
+  deck web --no-open --json >/dev/null 2>&1 || true
+  rm_head "Celular despierto"
+  rm_root "ᛖ"
+  rm_branch "deck publicado solo en tu red de Tailscale"
+  rm_branch "$(rm_grad "$origin")"
+  if [ "$auto" = 1 ]; then rm_last "$(rm_dim "acceso automático: tus dispositivos de Tailscale entran sin código")"
+  else rm_last "$(rm_dim "la primera vez en el celular pide un código:") $(rm_strong "rune remote pair")"; fi
+}
+
+remote_off() {
+  has tailscale && { tailscale serve --https=443 off >/dev/null 2>&1 || true; }
+  set_deck_web "" 0
+  restart_daemon
+  rm_line "  $(rm_dim "ᛖ") celular dormido $(rm_dim "· deck sigue en http://127.0.0.1:$PORT")"
+}
+
+remote_status() {
+  rm_head "Celular"
+  rm_root "ᛖ"
+  if ts_connected; then
+    rm_branch "Tailscale  $(rm_dim "conectado como") $(ts_origin)"
+    if remote_published; then rm_branch "deck  $(rm_c "$P_GREEN" "publicado")"; else rm_branch "deck  $(rm_dim "no publicado · rune remote on")"; fi
+    funnel_on && rm_branch "$(rm_c "$P_MAG" "Funnel encendido: apágalo con 'tailscale funnel reset'")"
+  else
+    rm_branch "Tailscale  $(rm_dim "no conectado")"
+  fi
+  local mode
+  mode="$(python3 -c 'import json,sys;w=json.load(open(sys.argv[1])).get("crossRunner",{}).get("web",{});print(("automático con Tailscale" if w.get("tailscaleServeAccess") else "con código de emparejamiento") if w.get("allowedOrigins") else "desactivado")' "$DECK_CONFIG" 2>/dev/null || echo desconocido)"
+  rm_last "acceso remoto en deck  $(rm_dim "$mode")"
+  echo
+  deck session devices 2>/dev/null || true
+}
+
+remote_pair() {
+  local data code exp
+  data="$(deck session pair --json 2>/dev/null)" || die "deck no pudo generar el código (¿está corriendo? prueba: deck web --no-open)"
+  code="$(printf '%s' "$data" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"])')"
+  exp="$(printf '%s' "$data" | python3 -c 'import json,sys,datetime;e=json.load(sys.stdin)["expiresAt"];d=datetime.datetime.fromisoformat(e.replace("Z","+00:00")).astimezone();print(d.strftime("%H:%M"))')"
+  rm_head "Código de emparejamiento"
+  rm_root "ᛖ"
+  rm_branch "$(rm_grad "$(printf '%s' "$code" | sed -E 's/(....)(....)/\1 \2/')")"
+  rm_branch "$(rm_dim "escríbelo en el celular · vence a las $exp · sirve una sola vez")"
+  rm_last "$(rm_dim "después toca la campana y activa las notificaciones para que dure 180 días")"
+}
+
+cmd_remote() {
+  case "${1:-status}" in
+    on) shift; remote_on "$@" ;;
+    off) remote_off ;;
+    status) remote_status ;;
+    pair) remote_pair ;;
+    devices) deck session devices ;;
+    revoke) [ -n "${2:-}" ] || die "¿qué dispositivo? (mira: rune remote devices)"; deck session devices revoke "$2" ;;
+    *) die "rune remote on|off|status|pair|devices|revoke" ;;
+  esac
+}
+
+cmd_log() {
+  [ -f "$RM_LOG" ] || die "todavía no hay registro de instalación"
+  ${PAGER:-less} "$RM_LOG" 2>/dev/null || cat "$RM_LOG"
+}
+
+# ---------- main ----------
+
+args=()
+for a in "$@"; do
+  case "$a" in
+    --quiet) QUIET=1 ;;
+    --hook) HOOK=1; QUIET=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+QUIET_FLAG=()
+[ "$QUIET" = 1 ] && QUIET_FLAG=(--quiet)
+
+case "${1:-}" in
+  remote|install|update|admin|log|version|--version|-v) ;;
+  *) load_catalog ;;
+esac
+
+case "${1:-}" in
+  ""|status) cmd_status ;;
+  list) cmd_list ;;
+  use) shift; [ $# -gt 0 ] || die "¿qué grimorio? (mira: rune list)"; root="$(repo_root)"; for p in "$@"; do use_pack "$root" "$p"; done ;;
+  off) shift; [ $# -gt 0 ] || die "¿qué grimorio? (mira: rune list)"; root="$(repo_root)"; for p in "$@"; do off_pack "$root" "$p"; done ;;
+  auto) cmd_auto ;;
+  remote) shift; cmd_remote "$@" ;;
+  install) shift; exec bash "$LIB/install.sh" "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  admin) shift; cmd_admin "$@" ;;
+  setup) cmd_setup ;;
+  log) cmd_log ;;
+  version|--version|-v) echo "runemind $VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

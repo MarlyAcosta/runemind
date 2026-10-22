@@ -1,0 +1,3 @@
+# Owner keys trusted by rune update (core and grimorios). One line per key: principal namespaces="git" key
+# Format: ssh-keygen(1) ALLOWED SIGNERS. Rotate by adding the new key in a commit signed with the old one.
+runemind-owner namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDP++CeOkr4LNINI/f6IOlvw47L2eEAgXDWUXXzGD2YH

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Project detection against throwaway fixtures (core catalog + a fixture grimorio with VTEX-style rules, read
+# through lib/catalog.py), plus rune auto in a plain repo.
+set -euo pipefail
+
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+fails=0
+
+# the private grimorios are not needed: a fixture one carries the manifest rules
+mkdir -p "$TMP/grimorios/fixture"
+cat > "$TMP/grimorios/fixture/grimorio.json" <<'EOF'
+{"packs": [
+  {"id": "vtex", "claude_name": "vtex", "dir": "plugins/vtex", "skills": [], "mode": "auto", "label": "VTEX IO",
+   "description": "fixture", "detect": {"manifest_keys": ["vendor", "builders"]}},
+  {"id": "vtex-io-backend", "claude_name": "vtex-io-backend", "dir": "plugins/vtex-io-backend", "skills": [],
+   "mode": "auto", "label": "VTEX IO backend", "description": "fixture",
+   "detect": {"manifest_builders": ["node", "graphql", "dotnet"]}}
+]}
+EOF
+
+fixture() { mkdir -p "$TMP/$1"; echo "$TMP/$1"; }
+put() { mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; }
+expect() {
+  local got
+  got="$(RUNEMIND_GRIMORIOS="$TMP/grimorios" python3 -I "$LIB/lib/catalog.py" detect "$TMP/$1")"
+  if [ "$got" = "$2" ]; then printf 'ok    %-22s %s\n' "$1" "$got"
+  else printf 'FAIL  %-22s got "%s", want "%s"\n' "$1" "$got" "$2"; fails=$((fails + 1)); fi
+}
+
+manifest='{"vendor": "acme", "name": "store", "builders": {"store": "0.x"}}'
+backend='{"vendor": "acme", "name": "api", "builders": {"node": "7.x", "graphql": "1.x"}}'
+
+put "$(fixture vtex-root)/manifest.json" "$manifest"
+put "$(fixture vtex-nested)/apps/a/b/manifest.json" "$manifest"
+put "$(fixture vtex-too-deep)/a/b/c/d/manifest.json" "$manifest"
+put "$(fixture vtex-node-modules)/node_modules/x/manifest.json" "$manifest"
+put "$(fixture web-manifest)/manifest.json" '{"name": "pwa", "icons": []}'
+put "$(fixture bad-json)/manifest.json" '{"vendor": '
+put "$(fixture shopify-app)/shopify.app.toml" 'name = "app"'
+put "$(fixture shopify-theme)/layout/theme.liquid" '<html></html>'
+mkdir -p "$(fixture shopify-dirs)/sections" "$TMP/shopify-dirs/snippets"
+mkdir -p "$(fixture sections-only)/sections"
+put "$(fixture shopify-remix)/package.json" '{"dependencies": {"@shopify/shopify-app-remix": "^3"}}'
+put "$(fixture faststore-core)/package.json" '{"dependencies": {"@faststore/core": "^3"}}'
+put "$(fixture faststore-cli)/package.json" '{"devDependencies": {"@faststore/cli": "^3"}}'
+put "$(fixture faststore-discovery)/discovery.config.js" 'module.exports = {}'
+put "$(fixture faststore-legacy)/faststore.config.js" 'module.exports = {}'
+put "$(fixture faststore-ui-only)/package.json" '{"dependencies": {"@faststore/ui": "^3"}}'
+put "$(fixture vtex-backend)/manifest.json" "$backend"
+put "$(fixture vtex-dotnet)/manifest.json" '{"vendor": "acme", "name": "api", "builders": {"dotnet": "2.x"}}'
+put "$(fixture vtex-graphql-only)/manifest.json" '{"vendor": "acme", "name": "api", "builders": {"graphql": "1.x"}}'
+put "$(fixture vtex-monorepo)/theme/manifest.json" "$manifest"
+put "$TMP/vtex-monorepo/apps/api/manifest.json" "$backend"
+put "$(fixture node-no-vendor)/manifest.json" '{"name": "x", "builders": {"node": "7.x"}}'
+put "$(fixture builders-list)/manifest.json" '{"vendor": "acme", "builders": ["node"]}'
+put "$(fixture vtex-and-shopify)/manifest.json" "$manifest"
+put "$TMP/vtex-and-shopify/shopify.app.toml" 'name = "app"'
+put "$(fixture plain)/README.md" 'hello'
+
+expect vtex-root vtex
+expect vtex-nested vtex
+expect vtex-too-deep custom
+expect vtex-node-modules custom
+expect web-manifest custom
+expect bad-json custom
+expect shopify-app shopify
+expect shopify-theme shopify
+expect shopify-dirs shopify
+expect sections-only custom
+expect shopify-remix shopify
+expect vtex-backend "vtex vtex-io-backend"
+expect vtex-dotnet "vtex vtex-io-backend"
+expect vtex-graphql-only "vtex vtex-io-backend"
+expect vtex-monorepo "vtex vtex-io-backend"
+expect node-no-vendor custom
+expect builders-list vtex
+expect faststore-core faststore
+expect faststore-cli faststore
+expect faststore-discovery faststore
+expect faststore-legacy faststore
+expect faststore-ui-only custom
+expect vtex-and-shopify "vtex shopify"
+expect plain custom
+
+# rune auto must not install the empty custom pack in a plain repo
+git -C "$TMP/plain" init --quiet
+out="$(cd "$TMP/plain" && HOME="$TMP/home" "$LIB/bin/rune" auto 2>&1)"
+if [ -z "$out" ] && [ ! -e "$TMP/plain/.claude" ] && [ ! -e "$TMP/plain/.agents" ]; then
+  echo "ok    rune auto (plain)      nothing installed"
+else
+  echo "FAIL  rune auto (plain)      installed something: $out"; fails=$((fails + 1))
+fi
+
+[ "$fails" = 0 ] || { echo "$fails detection check(s) failed"; exit 1; }

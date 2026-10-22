@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Shell syntax
+        run: for f in bin/* lib/*.sh install.sh bootstrap.sh scripts/test-* scripts/admin/*-*; do [ -f "$f" ] || continue; bash -n "$f"; done
+
+      # shellcheck is preinstalled on GitHub's Ubuntu runners
+      - name: shellcheck
+        run: shellcheck -x -S warning bin/* lib/*.sh install.sh bootstrap.sh scripts/test-detect scripts/test-split $(ls scripts/admin/*-* 2>/dev/null)
+
+      # the core catalog plus any grimorio.json present (the private repo carries one until the split)
+      - name: Catalog
+        run: python3 -I lib/catalog.py validate
+
+      - name: Plugin manifests
+        run: python3 -I lib/catalog.py check-marketplace
+
+      # upstream skills (catalog/packs.json "sources") are checked at their pinned tag
+      - name: Fetch pinned upstream skills
+        run: python3 -I lib/catalog.py fetch
+
+      - name: Skill lint
+        run: python3 -I scripts/lint-skills
+
+      - name: Project detection
+        run: scripts/test-detect
+
+      # core + grimorio split with local bare repos, a fake gh and throwaway signing keys
+      - name: Split, signed updates and migration
+        run: scripts/test-split
+
+      # `claude plugin validate` is not run here: it needs the Claude Code CLI on the runner.
+      # Run it locally on a generated marketplace (python3 -I lib/catalog.py write-marketplace) before pushing.
